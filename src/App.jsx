@@ -907,7 +907,7 @@ const handleCSVImport = (file) => {
       try {
         const text = e.target.result;
         // Détection format propre (généré par Claude)
-if (text.includes("type,categorie,libelle")) {
+if (text.includes("type;categorie;libelle")) {
   const rows = text.trim().split("\n").slice(1);
   const trans = rows.map(r => {
     const parts = r.split(",");
@@ -1619,5 +1619,6 @@ if (text.includes("type,categorie,libelle")) {
     </div>
   );
 }
+
 
 
