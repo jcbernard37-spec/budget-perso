@@ -1619,3 +1619,5 @@ if (text.includes("type,categorie,libelle")) {
     </div>
   );
 }
+
+
