@@ -899,42 +899,54 @@ export default function App() {
     return { type: "charge", category: "autres" };
   };
 
-  const handleCSVImport = (file) => {
+const handleCSVImport = (file) => {
     setCsvImporting(true);
     setImportError("");
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
         const text = e.target.result;
-        const lines = text.split("\n");
-        const transactions = [];
-        // Cherche la ligne d'en-tête des transactions (celle qui contient "Date;Libellé")
-        let dataStart = -1;
-        for (let i = 0; i < lines.length; i++) {
-          if (lines[i].includes("Date") && lines[i].includes("Libell")) { dataStart = i + 1; break; }
+        const headerMatch = text.match(/Date;Libell[^;]*;/);
+        if (!headerMatch) {
+          setImportError("Format CSV non reconnu. Utilise bien l'export du Crédit Agricole.");
+          setCsvImporting(false);
+          return;
         }
-        if (dataStart === -1) { setImportError("Format CSV non reconnu. Assure-toi d'utiliser un export Crédit Agricole."); setCsvImporting(false); return; }
-        for (let i = dataStart; i < lines.length; i++) {
-          const line = lines[i].trim();
-          if (!line) continue;
-          const parts = line.split(";");
-          if (parts.length < 4) continue;
-          const dateStr = parts[0].trim().replace(/"/g, "");
-          // Vérifie que c'est bien une date (format DD/MM/YYYY)
-          if (!/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) continue;
-          const libelle = parts[1].replace(/"/g, "").replace(/\n/g, " ").trim();
-          const debit = parseFloat(parts[2].replace(/"/g, "").replace(",", ".")) || 0;
-          const credit = parseFloat(parts[3].replace(/"/g, "").replace(",", ".")) || 0;
+        const dataText = text.slice(text.indexOf(headerMatch[0]) + headerMatch[0].length + 1);
+        const datePattern = /(\d{2}\/\d{2}\/\d{4});([\s\S]*?)(?=\n\d{2}\/\d{2}\/\d{4};|$)/g;
+        const transactions = [];
+        let match;
+        while ((match = datePattern.exec(dataText)) !== null) {
+          const dateStr = match[1];
+          const rest = match[2];
+          const fields = [];
+          let cur = "";
+          let inQ = false;
+          for (let i = 0; i < rest.length; i++) {
+            const ch = rest[i];
+            if (ch === '"') { inQ = !inQ; }
+            else if (ch === ";" && !inQ) { fields.push(cur); cur = ""; }
+            else { cur += ch; }
+          }
+          if (cur) fields.push(cur);
+          const libelle = (fields[0] || "").replace(/"/g, "").replace(/\s+/g, " ").trim();
+          const debitStr = (fields[1] || "").replace(/\s/g, "").replace(",", ".");
+          const creditStr = (fields[2] || "").replace(/\s/g, "").replace(",", ".");
+          const debit = parseFloat(debitStr) || 0;
+          const credit = parseFloat(creditStr) || 0;
           const montant = credit > 0 ? credit : debit;
           const sens = credit > 0 ? "credit" : "debit";
-          if (montant === 0) continue;
+          if (!libelle || montant === 0) continue;
           const cat = categorizeTransaction(libelle);
-          // Pour les crédits on force "revenu", pour les débits on utilise la détection
           const type = sens === "credit" ? "revenu" : cat.type;
-          const category = sens === "credit" ? cat.category : cat.category;
+          const category = cat.category;
           transactions.push({ id: uid(), date: dateStr, libelle, montant, sens, type, category, selected: true });
         }
-        if (transactions.length === 0) { setImportError("Aucune transaction trouvée dans ce fichier."); setCsvImporting(false); return; }
+        if (transactions.length === 0) {
+          setImportError("Aucune transaction trouvée. Vérifie que le fichier est bien un export CSV du Crédit Agricole.");
+          setCsvImporting(false);
+          return;
+        }
         setCsvTransactions(transactions);
       } catch (err) {
         setImportError("Erreur lors de la lecture du CSV : " + err.message);
