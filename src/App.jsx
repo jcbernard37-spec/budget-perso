@@ -1110,6 +1110,16 @@ if (text.includes("type,categorie,libelle")) {
               style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, color: C.slate, cursor: "pointer" }}>
               <Download size={14} /> Exporter en CSV
             </button>
+            <button
+  onClick={() => {
+    if (window.confirm("⚠️ Effacer TOUTES les données (revenus, charges, échéances) ? Action irréversible.")) {
+      update(() => emptyState());
+    }
+  }}
+  style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${C.clay}`, borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, color: C.clay, cursor: "pointer" }}
+>
+  🗑️ Tout effacer
+</button>
             <button className="export-btn" onClick={exportPDF}
               style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, color: C.slate, cursor: "pointer" }}>
               <FileText size={14} /> Exporter en PDF
