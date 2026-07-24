@@ -942,7 +942,7 @@ export default function App() {
         setCsvImporting(false);
       }
     };
-    reader.readAsText(file, "ISO-8859-1");
+    reader.readAsText(file, "windows-1252");
   };
 
   const handleCSVConfirm = () => {
