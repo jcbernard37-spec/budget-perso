@@ -906,6 +906,19 @@ const handleCSVImport = (file) => {
     reader.onload = (e) => {
       try {
         const text = e.target.result;
+        // Détection format propre (généré par Claude)
+if (text.includes("type,categorie,libelle")) {
+  const rows = text.trim().split("\n").slice(1);
+  const trans = rows.map(r => {
+    const parts = r.split(",");
+    const [type, categorie, ...rest] = parts;
+    const montant = parseFloat(parts[parts.length-2]) || 0;
+    const date = parts[parts.length-1]?.trim() || "";
+    const libelle = parts.slice(2, parts.length-2).join(",");
+    return { id: uid(), date, libelle, montant, sens: type==="revenu" ? "credit" : "debit", type, category: categorie, selected: true };
+  }).filter(t => t.montant > 0);
+  if (trans.length > 0) { setCsvTransactions(trans); setCsvImporting(false); return; }
+}
         const headerMatch = text.match(/Date;Libell[^;]*;/);
         if (!headerMatch) {
           setImportError("Format CSV non reconnu. Utilise bien l'export du Crédit Agricole.");
