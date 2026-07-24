@@ -3,7 +3,7 @@
 // GEMINI_API_KEY (variable d'environnement Vercel — jamais dans le code, jamais
 // envoyée au navigateur), et renvoie uniquement les montants/dates extraits.
 
-const MODEL = "gemini-2.0-flash";
+const MODEL = "gemini-1.5-flash";
 // Si ce modèle n'est plus proposé par Google, remplace le nom ci-dessus par celui
 // affiché dans ta console AI Studio (bouton "clé API" → liste des modèles).
 
