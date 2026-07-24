@@ -7,7 +7,7 @@ import {
   Home, Zap, Car, ShoppingCart, Users, HeartPulse, MoreHorizontal,
   Plus, Trash2, Pencil, AlertTriangle, CheckCircle2, Wallet,
   LayoutDashboard, Landmark, ClipboardList, X, Save, Loader2, Clock3,
-  Download, FileText, Cloud, CloudOff, Upload, ShieldCheck, Settings, Sparkles,
+  Download, FileText, Cloud, CloudOff, Upload, ShieldCheck, Settings, Sparkles, FileSpreadsheet,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -614,6 +614,8 @@ export default function App() {
   const [draftEcheance, setDraftEcheance] = useState(null);
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState("");
+  const [csvTransactions, setCsvTransactions] = useState(null);
+  const [csvImporting, setCsvImporting] = useState(false);
 
   // Charge d'abord le local (affichage instantané, jamais d'écran blanc),
   // puis réconcilie avec Google Drive en arrière-plan si un compte est connecté.
@@ -876,6 +878,91 @@ export default function App() {
     }
   };
 
+  // --- Import CSV Crédit Agricole ---
+  // Format CA : ligne d'en-tête, puis Date;Libellé;Débit euros;Crédit euros
+  // On skip les lignes d'en-tête (non-date) et on catégorise automatiquement.
+  const categorizeTransaction = (libelle) => {
+    const l = libelle.toLowerCase();
+    if (l.includes("salaire") || l.includes("virement employeur") || l.includes("paie") || l.includes("alternance")) return { type: "revenu", category: "salaire" };
+    if (l.includes("caf") || l.includes("allocations") || l.includes("apl")) return { type: "revenu", category: "caf" };
+    if (l.includes("dgfip") || l.includes("impot") || l.includes("tresor public")) return { type: "revenu", category: "autre" };
+    if (l.includes("audiens") || l.includes("mutuelle") || l.includes("prevoyance") || l.includes("malakoff") || l.includes("harmonie")) return { type: "charge", category: "sante" };
+    if (l.includes("loyer") || l.includes("habitat") || l.includes("cdc") || l.includes("hlm") || l.includes("bailleur")) return { type: "charge", category: "logement" };
+    if (l.includes("edf") || l.includes("engie") || l.includes("electricit") || l.includes("gaz") || l.includes("orange") || l.includes("sfr") || l.includes("free") || l.includes("bouygues") || l.includes("internet") || l.includes("box")) return { type: "charge", category: "energie" };
+    if (l.includes("essence") || l.includes("carburant") || l.includes("total") || l.includes("bp ") || l.includes("station") || l.includes("assurance auto") || l.includes("maaf") || l.includes("allianz") || l.includes("axa")) return { type: "charge", category: "transport" };
+    if (l.includes("leclerc") || l.includes("carrefour") || l.includes("lidl") || l.includes("aldi") || l.includes("intermarche") || l.includes("super") || l.includes("hyper") || l.includes("monoprix") || l.includes("courses")) return { type: "charge", category: "alimentation" };
+    if (l.includes("cantine") || l.includes("periscolaire") || l.includes("enfant") || l.includes("creche") || l.includes("garde") || l.includes("pension alimentaire")) return { type: "charge", category: "enfants" };
+    if (l.includes("netflix") || l.includes("spotify") || l.includes("amazon") || l.includes("disney") || l.includes("apple") || l.includes("abonnement")) return { type: "charge", category: "autres" };
+    if (l.includes("uber") || l.includes("deliveroo") || l.includes("just eat") || l.includes("restaurant") || l.includes("mcdo") || l.includes("burger")) return { type: "charge", category: "alimentation" };
+    if (l.includes("virement en votre faveur")) return { type: "revenu", category: "autre" };
+    if (l.includes("prelevement") || l.includes("paiement par carte") || l.includes("retrait")) return { type: "charge", category: "autres" };
+    return { type: "charge", category: "autres" };
+  };
+
+  const handleCSVImport = (file) => {
+    setCsvImporting(true);
+    setImportError("");
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target.result;
+        const lines = text.split("\n");
+        const transactions = [];
+        // Cherche la ligne d'en-tête des transactions (celle qui contient "Date;Libellé")
+        let dataStart = -1;
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].includes("Date") && lines[i].includes("Libell")) { dataStart = i + 1; break; }
+        }
+        if (dataStart === -1) { setImportError("Format CSV non reconnu. Assure-toi d'utiliser un export Crédit Agricole."); setCsvImporting(false); return; }
+        for (let i = dataStart; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          const parts = line.split(";");
+          if (parts.length < 4) continue;
+          const dateStr = parts[0].trim().replace(/"/g, "");
+          // Vérifie que c'est bien une date (format DD/MM/YYYY)
+          if (!/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) continue;
+          const libelle = parts[1].replace(/"/g, "").replace(/\n/g, " ").trim();
+          const debit = parseFloat(parts[2].replace(/"/g, "").replace(",", ".")) || 0;
+          const credit = parseFloat(parts[3].replace(/"/g, "").replace(",", ".")) || 0;
+          const montant = credit > 0 ? credit : debit;
+          const sens = credit > 0 ? "credit" : "debit";
+          if (montant === 0) continue;
+          const cat = categorizeTransaction(libelle);
+          // Pour les crédits on force "revenu", pour les débits on utilise la détection
+          const type = sens === "credit" ? "revenu" : cat.type;
+          const category = sens === "credit" ? cat.category : cat.category;
+          transactions.push({ id: uid(), date: dateStr, libelle, montant, sens, type, category, selected: true });
+        }
+        if (transactions.length === 0) { setImportError("Aucune transaction trouvée dans ce fichier."); setCsvImporting(false); return; }
+        setCsvTransactions(transactions);
+      } catch (err) {
+        setImportError("Erreur lors de la lecture du CSV : " + err.message);
+      } finally {
+        setCsvImporting(false);
+      }
+    };
+    reader.readAsText(file, "ISO-8859-1");
+  };
+
+  const handleCSVConfirm = () => {
+    if (!csvTransactions) return;
+    const selected = csvTransactions.filter((t) => t.selected);
+    const newIncomes = [];
+    const newCharges = [];
+    selected.forEach((t) => {
+      if (t.type === "revenu") {
+        newIncomes.push({ id: uid(), label: t.libelle.slice(0, 60), category: t.category, customCategory: "", amount: t.montant, periodicity: "ponctuel" });
+      } else {
+        newCharges.push({ id: uid(), label: t.libelle.slice(0, 60), category: t.category, amount: t.montant, periodicity: "mensuel", dueDay: "" });
+      }
+    });
+    update((s) => ({ ...s, incomes: [...s.incomes, ...newIncomes], charges: [...s.charges, ...newCharges] }));
+    setCsvTransactions(null);
+    setImportError("");
+    alert(`✅ ${newIncomes.length} revenu(s) et ${newCharges.length} charge(s) ajoutés !`);
+  };
+
   if (loading) {
     return (
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 400, color: C.slate, fontFamily: "Inter, sans-serif" }}>
@@ -983,19 +1070,23 @@ export default function App() {
               }}
             />
           </label>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <label
               className="export-btn"
-              onClick={exportCSV}
-              style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, color: C.slate, cursor: "pointer" }}
+              style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, color: C.slate, cursor: csvImporting ? "wait" : "pointer", opacity: csvImporting ? 0.65 : 1 }}
             >
+              {csvImporting ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <FileSpreadsheet size={14} />}
+              {csvImporting ? "Lecture…" : "Importer relevé CSV"}
+              <input type="file" accept=".csv,.txt" disabled={csvImporting} style={{ display: "none" }}
+                onChange={(e) => { if (e.target.files[0]) handleCSVImport(e.target.files[0]); e.target.value = ""; }}
+              />
+            </label>
+            <button className="export-btn" onClick={exportCSV}
+              style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, color: C.slate, cursor: "pointer" }}>
               <Download size={14} /> Exporter en CSV
             </button>
-            <button
-              className="export-btn"
-              onClick={exportPDF}
-              style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, color: C.slate, cursor: "pointer" }}
-            >
+            <button className="export-btn" onClick={exportPDF}
+              style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, color: C.slate, cursor: "pointer" }}>
               <FileText size={14} /> Exporter en PDF
             </button>
           </div>
@@ -1007,6 +1098,70 @@ export default function App() {
             <button onClick={() => setImportError("")} style={{ background: "none", border: "none", cursor: "pointer", color: C.clay, flexShrink: 0, display: "flex" }}>
               <X size={14} />
             </button>
+          </div>
+        )}
+
+        {/* Modal révision transactions CSV */}
+        {csvTransactions && (
+          <div style={{ background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 16, boxShadow: "0 4px 24px rgba(28,37,65,0.12)", padding: 24, marginBottom: 24 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div>
+                <h2 style={{ fontFamily: "Fraunces, serif", fontSize: 20, margin: 0 }}>Relevé importé — {csvTransactions.length} transactions</h2>
+                <p style={{ fontSize: 12.5, color: C.slateLight, margin: "4px 0 0" }}>Coche les transactions à ajouter à ton budget. Tu peux modifier la catégorie et le type avant de valider.</p>
+              </div>
+              <button onClick={() => setCsvTransactions(null)} style={{ background: "none", border: "none", cursor: "pointer", color: C.slate }}><X size={18} /></button>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              <button onClick={() => setCsvTransactions(csvTransactions.map((t) => ({ ...t, selected: true })))}
+                style={{ fontSize: 12, padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.sandLine}`, background: C.sand, cursor: "pointer", fontWeight: 600 }}>
+                Tout sélectionner
+              </button>
+              <button onClick={() => setCsvTransactions(csvTransactions.map((t) => ({ ...t, selected: false })))}
+                style={{ fontSize: 12, padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.sandLine}`, background: C.sand, cursor: "pointer", fontWeight: 600 }}>
+                Tout désélectionner
+              </button>
+              <span style={{ fontSize: 12, color: C.slateLight, alignSelf: "center" }}>
+                {csvTransactions.filter((t) => t.selected).length} sélectionnée(s)
+              </span>
+            </div>
+
+            <div style={{ maxHeight: 400, overflowY: "auto", border: `1px solid ${C.sandLine}`, borderRadius: 10 }}>
+              {csvTransactions.map((t, i) => (
+                <div key={t.id} style={{ display: "grid", gridTemplateColumns: "32px 90px 1fr 110px 90px 80px", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: i < csvTransactions.length - 1 ? `1px solid ${C.sandLine}` : "none", background: t.selected ? "#fff" : C.paper }}>
+                  <input type="checkbox" checked={t.selected} onChange={(e) => setCsvTransactions(csvTransactions.map((x, j) => j === i ? { ...x, selected: e.target.checked } : x))} style={{ width: 16, height: 16 }} />
+                  <span style={{ fontSize: 11.5, color: C.slateLight }}>{t.date}</span>
+                  <span style={{ fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={t.libelle}>{t.libelle}</span>
+                  <span style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 13, fontWeight: 700, color: t.sens === "credit" ? C.sage : C.clay, textAlign: "right" }}>
+                    {t.sens === "credit" ? "+" : "-"}{t.montant.toFixed(2)} €
+                  </span>
+                  <select value={t.type} onChange={(e) => setCsvTransactions(csvTransactions.map((x, j) => j === i ? { ...x, type: e.target.value } : x))}
+                    style={{ fontSize: 11.5, padding: "3px 6px", borderRadius: 6, border: `1px solid ${C.sandLine}`, background: t.type === "revenu" ? C.sageBg : C.clayBg }}>
+                    <option value="revenu">Revenu</option>
+                    <option value="charge">Charge</option>
+                  </select>
+                  <select value={t.category} onChange={(e) => setCsvTransactions(csvTransactions.map((x, j) => j === i ? { ...x, category: e.target.value } : x))}
+                    style={{ fontSize: 11.5, padding: "3px 6px", borderRadius: 6, border: `1px solid ${C.sandLine}` }}>
+                    {t.type === "revenu" ? (
+                      INCOME_CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)
+                    ) : (
+                      CHARGE_CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)
+                    )}
+                  </select>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 16 }}>
+              <button onClick={() => setCsvTransactions(null)}
+                style={{ padding: "9px 18px", borderRadius: 8, border: `1px solid ${C.sandLine}`, background: "#fff", fontWeight: 600, fontSize: 13.5, cursor: "pointer", color: C.slate }}>
+                Annuler
+              </button>
+              <button onClick={handleCSVConfirm}
+                style={{ padding: "9px 18px", borderRadius: 8, border: "none", background: C.ink, color: "#fff", fontWeight: 700, fontSize: 13.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+                <CheckCircle2 size={15} /> Ajouter {csvTransactions.filter((t) => t.selected).length} transaction(s) au budget
+              </button>
+            </div>
           </div>
         )}
 
