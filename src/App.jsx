@@ -3,6 +3,7 @@ import Papa from "papaparse";
 import { storage } from "./lib/storage.js";
 import * as Drive from "./lib/google-drive.js";
 import { extractDocument } from "./lib/gemini-parse.js";
+import { construireResume, analyserBudget } from "./lib/conseil.js";
 import {
   genererEcheances, genererProvisions, totalProvisionMensuelle,
   calculProvision, PROVISIONS_TYPES, zoneFiscale,
@@ -493,6 +494,70 @@ function Row({ left, mid, right, onEdit, onDelete }) {
 /* ------------------------------------------------------------------ */
 /*  Budget bar — signature dashboard element                           */
 /* ------------------------------------------------------------------ */
+
+/* Liste les opérations réellement passées sur le mois affiché.
+   Sans ça, le tableau de bord annonce un total que les onglets ne montrent
+   nulle part — c'est ce qui rendait l'écran Revenus vide et déroutant. */
+function OperationsDuMois({ transactions, type, mois, moisLabel, categories, onSupprimer }) {
+  const [ouvert, setOuvert] = useState(true);
+  const lignes = transactions
+    .filter((t) => t.type === type && (t.dateISO || "").slice(0, 7) === mois)
+    .sort((a, b) => b.dateISO.localeCompare(a.dateISO));
+
+  if (!lignes.length) return null;
+  const total = lignes.reduce((s, t) => s + t.montant, 0);
+  const couleur = type === "revenu" ? C.sage : C.clay;
+  const nomCat = (id) => categories.find((x) => x.id === id)?.label || id;
+
+  return (
+    <div style={{ background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 14, marginBottom: 20, overflow: "hidden" }}>
+      <button onClick={() => setOuvert((v) => !v)}
+        style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10,
+          padding: "14px 18px", background: "none", border: "none", cursor: "pointer", textAlign: "left" }}>
+        <div>
+          <div style={{ fontFamily: "Fraunces, serif", fontSize: 17, color: C.ink }}>
+            {type === "revenu" ? "Encaissé" : "Dépensé"} en {moisLabel}
+          </div>
+          <div style={{ fontSize: 12, color: C.slateLight }}>
+            {lignes.length} opération{lignes.length > 1 ? "s" : ""} · issues de tes relevés
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontFamily: "IBM Plex Mono, monospace", fontWeight: 700, fontSize: 16, color: couleur }}>
+            {fmt(total)}
+          </span>
+          <span style={{ fontSize: 12, color: C.slateLight }}>{ouvert ? "▾" : "▸"}</span>
+        </div>
+      </button>
+
+      {ouvert && (
+        <div style={{ borderTop: `1px solid ${C.sandLine}`, maxHeight: 340, overflowY: "auto" }}>
+          {lignes.map((t, i) => (
+            <div key={t.key || i}
+              style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 18px",
+                borderBottom: i < lignes.length - 1 ? `1px solid ${C.sandLine}` : "none" }}>
+              <span style={{ fontSize: 11.5, color: C.slateLight, width: 62, flexShrink: 0 }}>
+                {t.dateISO.slice(8, 10)}/{t.dateISO.slice(5, 7)}
+              </span>
+              <span style={{ flex: 1, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                title={t.libelle}>
+                {cleanLabel(t.libelle)}
+                <span style={{ fontSize: 11, color: C.slateLight, marginLeft: 8 }}>{nomCat(t.category)}</span>
+              </span>
+              <span style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 13, fontWeight: 600, color: couleur }}>
+                {fmt(t.montant)}
+              </span>
+              <IconBtn danger title="Retirer cette opération" onClick={() => onSupprimer(t.key)}>
+                <Trash2 size={13} />
+              </IconBtn>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BudgetBar({ totalIncome, byCategory, reste }) {
   const overflow = reste < 0;
   const base = overflow ? totalIncome - reste : totalIncome; // scale to include deficit
@@ -635,6 +700,9 @@ export default function App() {
   const [profils, setProfils] = useState(["caf", "enfants", "locataire", "vehicule"]);
   const [provChoisies, setProvChoisies] = useState(["rentree-scolaire", "entretien-vehicule", "noel"]);
   const [codePostal, setCodePostal] = useState("");
+  const [analyse, setAnalyse] = useState(null);
+  const [analyseEnCours, setAnalyseEnCours] = useState(false);
+  const [analyseErreur, setAnalyseErreur] = useState("");
 
   // Charge d'abord le local (affichage instantané, jamais d'écran blanc),
   // puis réconcilie avec Google Drive en arrière-plan si un compte est connecté.
@@ -902,6 +970,29 @@ export default function App() {
   /* --- Installation des échéances administratives + provisions ---------
      Crée en une fois le calendrier des démarches à ne pas oublier et les
      postes à provisionner. On n'ajoute jamais deux fois la même échéance. */
+  /* Analyse IA du budget. On n'envoie que des agrégats chiffrés :
+     aucun libellé brut, aucun nom, aucun numéro de compte. */
+  const lancerAnalyse = async () => {
+    setAnalyseEnCours(true);
+    setAnalyseErreur("");
+    setAnalyse(null);
+    try {
+      const resume = construireResume(state, selectedMonth, {
+        categories: allChargeCategories,
+      });
+      const r = await analyserBudget(resume);
+      setAnalyse(r);
+    } catch (e) {
+      setAnalyseErreur(e.message || "L'analyse a échoué.");
+    } finally {
+      setAnalyseEnCours(false);
+    }
+  };
+
+  // Retirer une opération importée (erreur de lecture, ligne en double...)
+  const supprimerOperation = (key) =>
+    update((s) => ({ ...s, transactions: (s.transactions || []).filter((t) => t.key !== key) }));
+
   const installerEcheances = () => {
     const nouvelles = genererEcheances(profils, uid, codePostal || state.codePostal || "");
     const dejaLa = new Set(state.echeances.map((e) => e.typeId).filter(Boolean));
@@ -1097,13 +1188,13 @@ export default function App() {
 
     const merged = [...(state.transactions || []), ...chosen.map(stripUi)];
 
-    // Charges fixes détectées automatiquement sur l'ensemble de l'historique
-    const recurrentes = detectRecurring(merged).filter((r) => r.type === "charge");
-    const dejaPresentes = new Set(
-      state.charges.map((c) => (c.label || "").toLowerCase().slice(0, 22))
-    );
+    // Charges fixes ET revenus réguliers détectés sur tout l'historique
+    const recurrentes = detectRecurring(merged);
+    const cle = (t) => (t || "").toLowerCase().slice(0, 22);
+
+    const dejaCharges = new Set(state.charges.map((c) => cle(c.label)));
     const nouvellesCharges = recurrentes
-      .filter((r) => !dejaPresentes.has(r.libelle.toLowerCase().slice(0, 22)))
+      .filter((r) => r.type === "charge" && !dejaCharges.has(cle(r.libelle)))
       .map((r) => ({
         id: uid(),
         label: r.libelle,
@@ -1114,11 +1205,25 @@ export default function App() {
         auto: true,
       }));
 
+    const dejaRevenus = new Set(state.incomes.map((i) => cle(i.label)));
+    const nouveauxRevenus = recurrentes
+      .filter((r) => r.type === "revenu" && !dejaRevenus.has(cle(r.libelle)))
+      .map((r) => ({
+        id: uid(),
+        label: r.libelle,
+        amount: r.montantMoyen,
+        periodicity: "mensuel",
+        category: r.category === "epargne" ? "autre" : r.category,
+        customCategory: "",
+        auto: true,
+      }));
+
     update((s) => ({
       ...s,
       transactions: merged,
       learned,
       charges: [...s.charges, ...nouvellesCharges],
+      incomes: [...s.incomes, ...nouveauxRevenus],
     }));
 
     setSelectedMonth(availableMonths(merged)[0] || null);
@@ -1127,8 +1232,8 @@ export default function App() {
     setImportError("");
     setImportInfo(
       `${chosen.length} opération(s) importée(s)` +
-        (nouvellesCharges.length
-          ? ` · ${nouvellesCharges.length} charge(s) fixe(s) détectée(s) automatiquement`
+        (nouvellesCharges.length || nouveauxRevenus.length
+          ? ` · ${nouvellesCharges.length} charge(s) fixe(s) et ${nouveauxRevenus.length} revenu(s) régulier(s) détectés`
           : "")
     );
   };
@@ -1475,6 +1580,110 @@ export default function App() {
               </div>
             </div>
 
+
+            {/* --- Analyse du budget par l'IA --- */}
+            <div style={{ background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 16, padding: 20, marginBottom: 22 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                <div>
+                  <h2 style={{ fontFamily: "Fraunces, serif", fontSize: 18, margin: 0 }}>Analyse de mon budget</h2>
+                  <p style={{ fontSize: 12.5, color: C.slateLight, margin: "3px 0 0" }}>
+                    Seuls des totaux chiffrés sont envoyés — aucun libellé, aucun nom, aucun numéro de compte.
+                  </p>
+                </div>
+                <button onClick={lancerAnalyse} disabled={analyseEnCours || !aDesTransactions}
+                  style={{ display: "flex", alignItems: "center", gap: 6, padding: "9px 16px", borderRadius: 8, border: "none",
+                    background: aDesTransactions ? C.ink : C.sandLine, color: "#fff", fontWeight: 700, fontSize: 13.5,
+                    cursor: aDesTransactions && !analyseEnCours ? "pointer" : "default", opacity: analyseEnCours ? 0.6 : 1 }}>
+                  {analyseEnCours
+                    ? <><Loader2 size={15} style={{ animation: "spin 1s linear infinite" }} /> Analyse…</>
+                    : <><Sparkles size={15} /> {analyse ? "Relancer" : "Analyser"}</>}
+                </button>
+              </div>
+
+              {!aDesTransactions && (
+                <p style={{ fontSize: 12.5, color: C.slateLight, margin: "12px 0 0" }}>
+                  Importe d'abord un relevé : sans données, il n'y a rien à analyser.
+                </p>
+              )}
+
+              {analyseErreur && (
+                <div style={{ background: C.clayBg, borderRadius: 10, padding: "10px 14px", marginTop: 14, fontSize: 12.5, color: C.slate }}>
+                  {analyseErreur}
+                </div>
+              )}
+
+              {analyse && (
+                <div style={{ marginTop: 16 }}>
+                  {analyse.synthese && (
+                    <div style={{ background: C.sand, borderRadius: 10, padding: "13px 16px", fontSize: 14, lineHeight: 1.5, color: C.ink, marginBottom: 16 }}>
+                      {analyse.synthese}
+                    </div>
+                  )}
+
+                  {Array.isArray(analyse.observations) && analyse.observations.length > 0 && (
+                    <>
+                      <div style={{ fontSize: 12.5, fontWeight: 700, color: C.slate, marginBottom: 8 }}>Ce que montrent les chiffres</div>
+                      {analyse.observations.map((o, i) => {
+                        const couleur = o.gravite === "alerte" ? C.clay : o.gravite === "attention" ? C.amber : C.sage;
+                        const fond = o.gravite === "alerte" ? C.clayBg : o.gravite === "attention" ? C.amberBg : C.sageBg;
+                        return (
+                          <div key={i} style={{ display: "flex", gap: 10, padding: "11px 14px", background: fond, borderRadius: 10, marginBottom: 8 }}>
+                            <span style={{ width: 6, borderRadius: 3, background: couleur, flexShrink: 0 }} />
+                            <div style={{ flex: 1 }}>
+                              <div style={{ fontSize: 13.5, fontWeight: 700, color: C.ink }}>
+                                {o.titre}
+                                {o.montant != null && (
+                                  <span style={{ fontFamily: "IBM Plex Mono, monospace", color: couleur, marginLeft: 8, fontWeight: 600 }}>
+                                    {fmt(o.montant)}
+                                  </span>
+                                )}
+                              </div>
+                              <div style={{ fontSize: 12.5, color: C.slate, marginTop: 3, lineHeight: 1.45 }}>{o.detail}</div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </>
+                  )}
+
+                  {Array.isArray(analyse.pistes) && analyse.pistes.length > 0 && (
+                    <>
+                      <div style={{ fontSize: 12.5, fontWeight: 700, color: C.slate, margin: "16px 0 8px" }}>Pistes à creuser</div>
+                      {analyse.pistes.map((p, i) => (
+                        <div key={i} style={{ border: `1px solid ${C.sandLine}`, borderRadius: 10, padding: "12px 14px", marginBottom: 8 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+                            <div style={{ fontSize: 13.5, fontWeight: 700, color: C.ink }}>{p.titre}</div>
+                            {p.gain_estime != null && p.gain_estime > 0 && (
+                              <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 13, fontWeight: 700, color: C.sage }}>
+                                ~{fmt(p.gain_estime)}/mois
+                              </div>
+                            )}
+                          </div>
+                          <div style={{ fontSize: 12.5, color: C.slate, marginTop: 4, lineHeight: 1.45 }}>{p.detail}</div>
+                          {p.a_verifier && (
+                            <div style={{ fontSize: 12, color: C.slateLight, marginTop: 6, paddingTop: 6, borderTop: `1px solid ${C.sandLine}` }}>
+                              À vérifier : {p.a_verifier}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </>
+                  )}
+
+                  {analyse.question && (
+                    <div style={{ background: C.amberBg, borderRadius: 10, padding: "12px 14px", marginTop: 12, fontSize: 13, color: C.slate }}>
+                      <strong>Une précision utile : </strong>{analyse.question}
+                    </div>
+                  )}
+
+                  <p style={{ fontSize: 11.5, color: C.slateLight, marginTop: 14, lineHeight: 1.45 }}>
+                    Analyse générée automatiquement à partir de tes chiffres. Les montants d'aides et de droits
+                    sont des ordres de grandeur : seuls la CAF, France Travail et les impôts font foi.
+                  </p>
+                </div>
+              )}
+            </div>
+
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
               {/* Répartition */}
               <div style={{ background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 14, boxShadow: "0 1px 2px rgba(28,37,65,0.05)", padding: 18 }}>
@@ -1528,12 +1737,31 @@ export default function App() {
 
         {view === "revenus" && (
           <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
               <h1 style={{ fontFamily: "Fraunces, serif", fontSize: 24, margin: 0 }}>Revenus</h1>
-              {editingIncome === null && (
-                <PrimaryBtn onClick={() => setEditingIncome("new")}><Plus size={15} /> Ajouter un revenu</PrimaryBtn>
-              )}
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                {mois.length > 0 && (
+                  <select value={selectedMonth || ""} onChange={(e) => setSelectedMonth(e.target.value)}
+                    style={{ fontSize: 13, fontWeight: 600, padding: "7px 10px", borderRadius: 8, border: `1px solid ${C.sandLine}`, background: "#fff", color: C.ink, cursor: "pointer" }}>
+                    {mois.map((m) => <option key={m} value={m}>{monthLabel(m)}</option>)}
+                  </select>
+                )}
+                {editingIncome === null && (
+                  <PrimaryBtn onClick={() => setEditingIncome("new")}><Plus size={15} /> Ajouter un revenu</PrimaryBtn>
+                )}
+              </div>
             </div>
+
+            {useReel && (
+              <OperationsDuMois
+                transactions={state.transactions}
+                type="revenu"
+                mois={selectedMonth}
+                moisLabel={monthLabel(selectedMonth)}
+                categories={INCOME_CATEGORIES}
+                onSupprimer={supprimerOperation}
+              />
+            )}
 
             {editingIncome === "new" && (
               <>
@@ -1594,12 +1822,31 @@ export default function App() {
 
         {view === "charges" && (
           <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
               <h1 style={{ fontFamily: "Fraunces, serif", fontSize: 24, margin: 0 }}>Charges</h1>
-              {editingCharge === null && (
-                <PrimaryBtn onClick={() => setEditingCharge("new")}><Plus size={15} /> Ajouter une charge</PrimaryBtn>
-              )}
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                {mois.length > 0 && (
+                  <select value={selectedMonth || ""} onChange={(e) => setSelectedMonth(e.target.value)}
+                    style={{ fontSize: 13, fontWeight: 600, padding: "7px 10px", borderRadius: 8, border: `1px solid ${C.sandLine}`, background: "#fff", color: C.ink, cursor: "pointer" }}>
+                    {mois.map((m) => <option key={m} value={m}>{monthLabel(m)}</option>)}
+                  </select>
+                )}
+                {editingCharge === null && (
+                  <PrimaryBtn onClick={() => setEditingCharge("new")}><Plus size={15} /> Ajouter une charge</PrimaryBtn>
+                )}
+              </div>
             </div>
+
+            {useReel && (
+              <OperationsDuMois
+                transactions={state.transactions}
+                type="charge"
+                mois={selectedMonth}
+                moisLabel={monthLabel(selectedMonth)}
+                categories={allChargeCategories}
+                onSupprimer={supprimerOperation}
+              />
+            )}
 
             {editingCharge === "new" && (
               <ChargeForm
