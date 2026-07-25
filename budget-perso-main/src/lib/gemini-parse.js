@@ -63,13 +63,7 @@ export async function extractDocument(file) {
 
   const json = await res.json().catch(() => ({}));
   if (!res.ok) {
-    // On remonte le message ET le conseil d'action, pour que l'utilisateur
-    // sache quoi faire plutôt que de rester devant un "erreur serveur".
-    const message = json.error || `Erreur serveur (${res.status}).`;
-    const err = new Error(json.conseil ? `${message} ${json.conseil}` : message);
-    err.details = json.details;
-    err.status = res.status;
-    throw err;
+    throw new Error(json.error || `Erreur serveur (${res.status}).`);
   }
   return json;
 }

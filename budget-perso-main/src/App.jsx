@@ -4,15 +4,6 @@ import { storage } from "./lib/storage.js";
 import * as Drive from "./lib/google-drive.js";
 import { extractDocument } from "./lib/gemini-parse.js";
 import {
-  genererEcheances, genererProvisions, totalProvisionMensuelle,
-  calculProvision, PROVISIONS_TYPES, zoneFiscale,
-} from "./lib/echeances-types.js";
-import {
-  readFileSmart, parseStatement, detectRecurring, removeDuplicates,
-  availableMonths, monthTotals, monthLabel, monthKey, resteParJour, cleanLabel,
-  categorize, isoToFR, dedupKey,
-} from "./lib/import-engine.js";
-import {
   Home, Zap, Car, ShoppingCart, Users, HeartPulse, MoreHorizontal,
   Plus, Trash2, Pencil, AlertTriangle, CheckCircle2, Wallet,
   LayoutDashboard, Landmark, ClipboardList, X, Save, Loader2, Clock3,
@@ -113,9 +104,6 @@ const emptyState = () => ({
   charges: [],
   echeances: [],
   customChargeCategories: [],
-  transactions: [],   // historique brut importé des relevés
-  provisions: [],     // dépenses non mensuelles lissées sur l'année
-  learned: {},        // règles de catégorisation apprises des corrections
   updatedAt: null,
 });
 
@@ -628,13 +616,6 @@ export default function App() {
   const [importError, setImportError] = useState("");
   const [csvTransactions, setCsvTransactions] = useState(null);
   const [csvImporting, setCsvImporting] = useState(false);
-  const [csvDuplicates, setCsvDuplicates] = useState(0);
-  const [importInfo, setImportInfo] = useState("");
-  const [selectedMonth, setSelectedMonth] = useState(null);
-  const [showSetup, setShowSetup] = useState(false);
-  const [profils, setProfils] = useState(["caf", "enfants", "locataire", "vehicule"]);
-  const [provChoisies, setProvChoisies] = useState(["rentree-scolaire", "entretien-vehicule", "noel"]);
-  const [codePostal, setCodePostal] = useState("");
 
   // Charge d'abord le local (affichage instantané, jamais d'écran blanc),
   // puis réconcilie avec Google Drive en arrière-plan si un compte est connecté.
@@ -713,51 +694,15 @@ export default function App() {
     [state.customChargeCategories]
   );
 
-  /* --- Mois disponibles dans l'historique importé --- */
-  const mois = useMemo(
-    () => availableMonths(state.transactions || []),
-    [state.transactions]
-  );
-
-  // Par défaut : le mois le plus récent de l'historique
-  useEffect(() => {
-    if (!selectedMonth && mois.length) setSelectedMonth(mois[0]);
-  }, [mois, selectedMonth]);
-
-  const aDesTransactions = (state.transactions || []).length > 0;
-
-  /* Totaux du mois affiché. S'il y a un historique importé, il fait foi :
-     c'est le réel. Sinon on retombe sur les lignes saisies à la main. */
-  const totauxMois = useMemo(
-    () => (selectedMonth ? monthTotals(state.transactions || [], selectedMonth) : null),
-    [state.transactions, selectedMonth]
-  );
-
-  const saisiIncome = useMemo(
+  const totalIncome = useMemo(
     () => state.incomes.reduce((s, i) => s + toMonthly(i.amount, i.periodicity), 0),
     [state.incomes]
   );
-  const saisiCharges = useMemo(
+  const totalCharges = useMemo(
     () => state.charges.reduce((s, c) => s + toMonthly(c.amount, c.periodicity), 0),
     [state.charges]
   );
-
-  const useReel = aDesTransactions && totauxMois;
-  const totalIncome = useReel ? totauxMois.revenus : saisiIncome;
-  const totalCharges = useReel ? totauxMois.charges : saisiCharges;
-  const totalEpargne = useReel ? totauxMois.epargne : 0;
-
-  // Les provisions sont traitées comme une charge : si on doit mettre 120 €
-  // de côté ce mois-ci pour la rentrée, ces 120 € ne sont pas disponibles.
-  const totalProvisions = useMemo(
-    () => totalProvisionMensuelle(state.provisions || []),
-    [state.provisions]
-  );
-
-  const reste = totalIncome - totalCharges - totalEpargne - totalProvisions;
-
-  // Combien il reste par jour d'ici la fin du mois (mois en cours seulement)
-  const parJour = useReel ? resteParJour(reste, selectedMonth) : null;
+  const reste = totalIncome - totalCharges;
 
   const ratio = totalIncome > 0 ? reste / totalIncome : reste >= 0 ? 1 : -1;
   const status =
@@ -767,14 +712,6 @@ export default function App() {
   const statusLabel = { sage: "Situation confortable", amber: "Marge serrée", clay: "Déficit ce mois-ci" }[status];
 
   const byCategory = useMemo(() => {
-    // Avec un historique importé, la répartition reflète les dépenses
-    // réellement passées sur le mois affiché.
-    if (useReel) {
-      const parCat = totauxMois.parCategorie || {};
-      return allChargeCategories
-        .map((cat) => ({ ...cat, monthly: parCat[cat.id] || 0 }))
-        .sort((a, b) => b.monthly - a.monthly);
-    }
     return allChargeCategories
       .map((cat) => ({
         ...cat,
@@ -783,7 +720,7 @@ export default function App() {
           .reduce((s, c) => s + toMonthly(c.amount, c.periodicity), 0),
       }))
       .sort((a, b) => b.monthly - a.monthly);
-  }, [state.charges, allChargeCategories, useReel, totauxMois]);
+  }, [state.charges, allChargeCategories]);
 
   const today = new Date();
   const upcoming = useMemo(() => {
@@ -899,96 +836,15 @@ export default function App() {
     }
   };
 
-  /* --- Installation des échéances administratives + provisions ---------
-     Crée en une fois le calendrier des démarches à ne pas oublier et les
-     postes à provisionner. On n'ajoute jamais deux fois la même échéance. */
-  const installerEcheances = () => {
-    const nouvelles = genererEcheances(profils, uid, codePostal || state.codePostal || "");
-    const dejaLa = new Set(state.echeances.map((e) => e.typeId).filter(Boolean));
-    const aAjouter = nouvelles.filter((e) => !dejaLa.has(e.typeId));
-
-    const prov = genererProvisions(provChoisies, uid);
-    const provDejaLa = new Set((state.provisions || []).map((p) => p.typeId));
-    const provAAjouter = prov.filter((p) => !provDejaLa.has(p.typeId));
-
-    update((s) => ({
-      ...s,
-      codePostal: codePostal || s.codePostal || "",
-      echeances: [...s.echeances, ...aAjouter],
-      provisions: [...(s.provisions || []), ...provAAjouter],
-    }));
-
-    setShowSetup(false);
-    setImportInfo(
-      `${aAjouter.length} échéance(s) et ${provAAjouter.length} provision(s) installées.` +
-        (aAjouter.length < nouvelles.length ? " Les doublons ont été ignorés." : "")
-    );
-  };
-
-  /* --- Import de document par IA (Gemini) -------------------------------
-     Deux garde-fous par rapport à avant :
-     1. Si le fichier est un tableau (CSV/TXT/Excel), on n'appelle PAS l'IA :
-        le moteur d'import est plus fiable ET ne consomme aucun quota.
-     2. Si l'IA reconnaît un relevé bancaire, ses opérations passent par la
-        même écran de révision que l'import CSV.
-     L'IA ne fait jamais qu'une proposition : rien n'entre dans le budget
-     sans validation explicite. */
+  // --- Import de document par IA (Gemini) ---
+  // L'IA ne fait QUE pré-remplir un formulaire existant : rien n'est jamais
+  // écrit dans le budget sans un clic explicite sur "Enregistrer".
   const handleDocumentImport = async (file) => {
-    const nom = (file.name || "").toLowerCase();
-    const estTableau =
-      /\.(csv|txt|tsv|xlsx|xls)$/.test(nom) ||
-      /csv|excel|spreadsheet|text\/plain/.test(file.type || "");
-
-    // Un CSV n'a rien à faire chez l'IA : on redirige silencieusement.
-    if (estTableau) {
-      setImportInfo("Fichier tableur détecté — traité par l'import direct (plus fiable, sans quota IA).");
-      return handleCSVImport(file);
-    }
-
     setImporting(true);
     setImportError("");
     try {
       const result = await extractDocument(file);
-
-      // --- Relevé bancaire reconnu par l'IA ---
-      if (Array.isArray(result.transactions) && result.transactions.length) {
-        const lignes = result.transactions
-          .map((t) => {
-            const montant = Math.abs(Number(t.montant) || 0);
-            if (!montant || !t.date) return null;
-            const libelle = String(t.libelle || "").trim();
-            const colSign = t.sens === "credit" ? "credit" : "debit";
-            const v = categorize(libelle, colSign);
-            const type = v.type || (colSign === "credit" ? "revenu" : "charge");
-            return {
-              dateISO: t.date,
-              dateFR: isoToFR(t.date),
-              libelle,
-              montant,
-              colSign,
-              type,
-              category: v.category || (type === "revenu" ? "autre" : "autres"),
-              certain: v.matched,
-              selected: true,
-              key: dedupKey(t.date, montant, libelle),
-            };
-          })
-          .filter(Boolean);
-
-        const { kept, removed } = removeDuplicates(
-          lignes,
-          (state.transactions || []).map((t) => t.key)
-        );
-        if (!kept.length) {
-          setImportError(`Les ${removed} opérations lues sont déjà dans ton budget.`);
-        } else {
-          setCsvDuplicates(removed);
-          setCsvTransactions(kept);
-          setView("dashboard");
-        }
-      }
-      // --- Fiche de paye ---
-      else if (result.revenu) {
+      if (result.revenu) {
         setDraftIncome({
           label: result.revenu.libelle || "Salaire",
           category: "salaire",
@@ -998,9 +854,7 @@ export default function App() {
         });
         setView("revenus");
         setEditingIncome("new");
-      }
-      // --- Document avec une échéance ---
-      else if (result.echeance) {
+      } else if (result.echeance) {
         setDraftEcheance({
           title: result.echeance.titre || "Échéance",
           category: result.echeance.categorie || "autre",
@@ -1014,153 +868,100 @@ export default function App() {
       } else {
         setImportError(
           result.remarque ||
-            "Document non identifié. Si c'est un relevé, exporte-le en CSV depuis ta banque : l'import direct le lira sans souci."
+            "Je n'ai pas réussi à identifier ce document. Vérifie qu'il s'agit bien d'une fiche de paye ou d'un document avec une échéance, ou saisis les infos à la main."
         );
       }
     } catch (e) {
-      // Le message contient déjà le conseil d'action renvoyé par le serveur.
       setImportError(e.message || "Erreur lors de l'analyse du document.");
     } finally {
       setImporting(false);
     }
   };
 
-
   // --- Import CSV Crédit Agricole ---
-  // Format CA : encodage CP1252 (Windows-1252), libellés entre guillemets avec
-  // sauts de ligne internes, séparateur point-virgule.
-  /* ================================================================
-     IMPORT DE RELEVÉ — moteur universel
-     ---------------------------------------------------------------
-     Accepte n'importe quel CSV/TXT bancaire : le séparateur, l'encodage
-     et les colonnes sont détectés automatiquement. Le tri se fait sur
-     le SENS de l'opération + le libellé, jamais sur la seule colonne.
-     ================================================================ */
-  const handleCSVImport = async (file) => {
+  // Format CA : ligne d'en-tête, puis Date;Libellé;Débit euros;Crédit euros
+  // On skip les lignes d'en-tête (non-date) et on catégorise automatiquement.
+  const categorizeTransaction = (libelle) => {
+    const l = libelle.toLowerCase();
+    if (l.includes("salaire") || l.includes("virement employeur") || l.includes("paie") || l.includes("alternance")) return { type: "revenu", category: "salaire" };
+    if (l.includes("caf") || l.includes("allocations") || l.includes("apl")) return { type: "revenu", category: "caf" };
+    if (l.includes("dgfip") || l.includes("impot") || l.includes("tresor public")) return { type: "revenu", category: "autre" };
+    if (l.includes("audiens") || l.includes("mutuelle") || l.includes("prevoyance") || l.includes("malakoff") || l.includes("harmonie")) return { type: "charge", category: "sante" };
+    if (l.includes("loyer") || l.includes("habitat") || l.includes("cdc") || l.includes("hlm") || l.includes("bailleur")) return { type: "charge", category: "logement" };
+    if (l.includes("edf") || l.includes("engie") || l.includes("electricit") || l.includes("gaz") || l.includes("orange") || l.includes("sfr") || l.includes("free") || l.includes("bouygues") || l.includes("internet") || l.includes("box")) return { type: "charge", category: "energie" };
+    if (l.includes("essence") || l.includes("carburant") || l.includes("total") || l.includes("bp ") || l.includes("station") || l.includes("assurance auto") || l.includes("maaf") || l.includes("allianz") || l.includes("axa")) return { type: "charge", category: "transport" };
+    if (l.includes("leclerc") || l.includes("carrefour") || l.includes("lidl") || l.includes("aldi") || l.includes("intermarche") || l.includes("super") || l.includes("hyper") || l.includes("monoprix") || l.includes("courses")) return { type: "charge", category: "alimentation" };
+    if (l.includes("cantine") || l.includes("periscolaire") || l.includes("enfant") || l.includes("creche") || l.includes("garde") || l.includes("pension alimentaire")) return { type: "charge", category: "enfants" };
+    if (l.includes("netflix") || l.includes("spotify") || l.includes("amazon") || l.includes("disney") || l.includes("apple") || l.includes("abonnement")) return { type: "charge", category: "autres" };
+    if (l.includes("uber") || l.includes("deliveroo") || l.includes("just eat") || l.includes("restaurant") || l.includes("mcdo") || l.includes("burger")) return { type: "charge", category: "alimentation" };
+    if (l.includes("virement en votre faveur")) return { type: "revenu", category: "autre" };
+    if (l.includes("prelevement") || l.includes("paiement par carte") || l.includes("retrait")) return { type: "charge", category: "autres" };
+    return { type: "charge", category: "autres" };
+  };
+
+  const handleCSVImport = (file) => {
     setCsvImporting(true);
     setImportError("");
-    try {
-      const text = await readFileSmart(file);
-      const res = parseStatement(text, state.learned);
-
-      if (!res.ok) {
-        setImportError(
-          res.error +
-            (res.needsMapping
-              ? " Envoie-moi le fichier et j'ajoute son format."
-              : "")
-        );
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target.result;
+        const lines = text.split("\n");
+        const transactions = [];
+        // Cherche la ligne d'en-tête des transactions (celle qui contient "Date;Libellé")
+        let dataStart = -1;
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].includes("Date") && lines[i].includes("Libell")) { dataStart = i + 1; break; }
+        }
+        if (dataStart === -1) { setImportError("Format CSV non reconnu. Assure-toi d'utiliser un export Crédit Agricole."); setCsvImporting(false); return; }
+        for (let i = dataStart; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          const parts = line.split(";");
+          if (parts.length < 4) continue;
+          const dateStr = parts[0].trim().replace(/"/g, "");
+          // Vérifie que c'est bien une date (format DD/MM/YYYY)
+          if (!/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) continue;
+          const libelle = parts[1].replace(/"/g, "").replace(/\n/g, " ").trim();
+          const debit = parseFloat(parts[2].replace(/"/g, "").replace(",", ".")) || 0;
+          const credit = parseFloat(parts[3].replace(/"/g, "").replace(",", ".")) || 0;
+          const montant = credit > 0 ? credit : debit;
+          const sens = credit > 0 ? "credit" : "debit";
+          if (montant === 0) continue;
+          const cat = categorizeTransaction(libelle);
+          // Pour les crédits on force "revenu", pour les débits on utilise la détection
+          const type = sens === "credit" ? "revenu" : cat.type;
+          const category = sens === "credit" ? cat.category : cat.category;
+          transactions.push({ id: uid(), date: dateStr, libelle, montant, sens, type, category, selected: true });
+        }
+        if (transactions.length === 0) { setImportError("Aucune transaction trouvée dans ce fichier."); setCsvImporting(false); return; }
+        setCsvTransactions(transactions);
+      } catch (err) {
+        setImportError("Erreur lors de la lecture du CSV : " + err.message);
+      } finally {
         setCsvImporting(false);
-        return;
       }
-
-      // On écarte ce qui a déjà été importé (réimport sans risque)
-      const existingKeys = (state.transactions || []).map((t) => t.key);
-      const { kept, removed } = removeDuplicates(res.transactions, existingKeys);
-
-      if (!kept.length) {
-        setImportError(
-          `Toutes les opérations de ce fichier (${removed}) sont déjà dans ton budget.`
-        );
-        setCsvImporting(false);
-        return;
-      }
-
-      setCsvDuplicates(removed);
-      setCsvTransactions(kept);
-    } catch (err) {
-      setImportError("Erreur de lecture : " + err.message);
-    } finally {
-      setCsvImporting(false);
-    }
+    };
+    reader.readAsText(file, "ISO-8859-1");
   };
 
-  /* Validation de l'import : on enregistre l'historique, on mémorise les
-     corrections manuelles, et on crée automatiquement les charges fixes
-     repérées comme récurrentes. */
   const handleCSVConfirm = () => {
-    const chosen = (csvTransactions || []).filter((t) => t.selected);
-    if (!chosen.length) {
-      setCsvTransactions(null);
-      return;
-    }
-
-    // Mémorisation : si l'utilisateur a corrigé une ligne, on retient le
-    // marchand pour que le prochain import soit juste du premier coup.
-    const learned = { ...(state.learned || {}) };
-    for (const t of chosen) {
-      if (t.corrected) {
-        const cle = motCle(t.libelle);
-        if (cle) learned[cle] = { type: t.type, category: t.category };
+    if (!csvTransactions) return;
+    const selected = csvTransactions.filter((t) => t.selected);
+    const newIncomes = [];
+    const newCharges = [];
+    selected.forEach((t) => {
+      if (t.type === "revenu") {
+        newIncomes.push({ id: uid(), label: t.libelle.slice(0, 60), category: t.category, customCategory: "", amount: t.montant, periodicity: "ponctuel" });
+      } else {
+        newCharges.push({ id: uid(), label: t.libelle.slice(0, 60), category: t.category, amount: t.montant, periodicity: "mensuel", dueDay: "" });
       }
-    }
-
-    const merged = [...(state.transactions || []), ...chosen.map(stripUi)];
-
-    // Charges fixes détectées automatiquement sur l'ensemble de l'historique
-    const recurrentes = detectRecurring(merged).filter((r) => r.type === "charge");
-    const dejaPresentes = new Set(
-      state.charges.map((c) => (c.label || "").toLowerCase().slice(0, 22))
-    );
-    const nouvellesCharges = recurrentes
-      .filter((r) => !dejaPresentes.has(r.libelle.toLowerCase().slice(0, 22)))
-      .map((r) => ({
-        id: uid(),
-        label: r.libelle,
-        amount: r.montantMoyen,
-        periodicity: "mensuel",
-        category: r.category,
-        dueDay: r.jour || "",
-        auto: true,
-      }));
-
-    update((s) => ({
-      ...s,
-      transactions: merged,
-      learned,
-      charges: [...s.charges, ...nouvellesCharges],
-    }));
-
-    setSelectedMonth(availableMonths(merged)[0] || null);
+    });
+    update((s) => ({ ...s, incomes: [...s.incomes, ...newIncomes], charges: [...s.charges, ...newCharges] }));
     setCsvTransactions(null);
-    setCsvDuplicates(0);
     setImportError("");
-    setImportInfo(
-      `${chosen.length} opération(s) importée(s)` +
-        (nouvellesCharges.length
-          ? ` · ${nouvellesCharges.length} charge(s) fixe(s) détectée(s) automatiquement`
-          : "")
-    );
+    alert(`✅ ${newIncomes.length} revenu(s) et ${newCharges.length} charge(s) ajoutés !`);
   };
-
-  // Retire les champs d'affichage avant stockage
-  const stripUi = (t) => ({
-    dateISO: t.dateISO,
-    libelle: t.libelle,
-    montant: t.montant,
-    type: t.type,
-    category: t.category,
-    key: t.key,
-  });
-
-  // Mot-clé retenu pour l'apprentissage (le marchand, pas la référence)
-  const motCle = (libelle) => {
-    const mots = String(libelle || "")
-      .replace(/\b\d+\b/g, " ")
-      .replace(/[^A-Za-zÀ-ÿ ]/g, " ")
-      .split(/\s+/)
-      .filter(
-        (m) =>
-          m.length > 3 &&
-          !/^(paiement|carte|prelevement|prélèvement|virement|emis|émis|votre|faveur|vers|pour)$/i.test(m)
-      );
-    return mots.slice(0, 2).join(" ") || null;
-  };
-
-  const majTransaction = (id, patch) =>
-    setCsvTransactions((prev) =>
-      prev.map((t) => (t.key === id ? { ...t, ...patch, corrected: true } : t))
-    );
 
   if (loading) {
     return (
@@ -1260,7 +1061,7 @@ export default function App() {
             {importing ? "Analyse en cours…" : "Importer un document (IA)"}
             <input
               type="file"
-              accept="image/*,application/pdf,.csv,.txt,.tsv"
+              accept="image/*,application/pdf"
               disabled={importing}
               style={{ display: "none" }}
               onChange={(e) => {
@@ -1276,7 +1077,7 @@ export default function App() {
             >
               {csvImporting ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <FileSpreadsheet size={14} />}
               {csvImporting ? "Lecture…" : "Importer relevé CSV"}
-              <input type="file" accept=".csv,.txt,.tsv,text/csv,text/plain" disabled={csvImporting} style={{ display: "none" }}
+              <input type="file" accept=".csv,.txt" disabled={csvImporting} style={{ display: "none" }}
                 onChange={(e) => { if (e.target.files[0]) handleCSVImport(e.target.files[0]); e.target.value = ""; }}
               />
             </label>
@@ -1303,34 +1104,15 @@ export default function App() {
         {/* Modal révision transactions CSV */}
         {csvTransactions && (
           <div style={{ background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 16, boxShadow: "0 4px 24px rgba(28,37,65,0.12)", padding: 24, marginBottom: 24 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
               <div>
-                <h2 style={{ fontFamily: "Fraunces, serif", fontSize: 20, margin: 0 }}>
-                  Relevé importé — {csvTransactions.length} opérations
-                </h2>
-                <p style={{ fontSize: 12.5, color: C.slateLight, margin: "4px 0 0" }}>
-                  Tout est déjà trié automatiquement. Corrige seulement ce qui te semble faux —
-                  l'appli retiendra tes corrections pour les prochains imports.
-                </p>
-                {csvDuplicates > 0 && (
-                  <p style={{ fontSize: 12, color: C.sage, margin: "6px 0 0", fontWeight: 600 }}>
-                    {csvDuplicates} opération(s) déjà présente(s) ont été ignorées.
-                  </p>
-                )}
+                <h2 style={{ fontFamily: "Fraunces, serif", fontSize: 20, margin: 0 }}>Relevé importé — {csvTransactions.length} transactions</h2>
+                <p style={{ fontSize: 12.5, color: C.slateLight, margin: "4px 0 0" }}>Coche les transactions à ajouter à ton budget. Tu peux modifier la catégorie et le type avant de valider.</p>
               </div>
-              <button onClick={() => { setCsvTransactions(null); setCsvDuplicates(0); }} style={{ background: "none", border: "none", cursor: "pointer", color: C.slate }}><X size={18} /></button>
+              <button onClick={() => setCsvTransactions(null)} style={{ background: "none", border: "none", cursor: "pointer", color: C.slate }}><X size={18} /></button>
             </div>
 
-            {/* Les lignes incertaines sont mises en avant : c'est là que
-                l'attention de l'utilisateur est utile. */}
-            {csvTransactions.some((t) => !t.certain) && (
-              <div style={{ background: C.amberBg, border: `1px solid ${C.amber}33`, borderRadius: 10, padding: "10px 14px", marginBottom: 12, fontSize: 12.5, color: C.slate }}>
-                <strong>{csvTransactions.filter((t) => !t.certain).length} opération(s)</strong> n'ont pas pu être
-                classées avec certitude (marchand inconnu). Elles sont signalées par un point orange.
-              </div>
-            )}
-
-            <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
               <button onClick={() => setCsvTransactions(csvTransactions.map((t) => ({ ...t, selected: true })))}
                 style={{ fontSize: 12, padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.sandLine}`, background: C.sand, cursor: "pointer", fontWeight: 600 }}>
                 Tout sélectionner
@@ -1339,49 +1121,28 @@ export default function App() {
                 style={{ fontSize: 12, padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.sandLine}`, background: C.sand, cursor: "pointer", fontWeight: 600 }}>
                 Tout désélectionner
               </button>
-              <button onClick={() => setCsvTransactions(csvTransactions.map((t) => ({ ...t, selected: !t.certain })))}
-                style={{ fontSize: 12, padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.sandLine}`, background: C.amberBg, cursor: "pointer", fontWeight: 600 }}>
-                Ne montrer que les incertaines
-              </button>
               <span style={{ fontSize: 12, color: C.slateLight, alignSelf: "center" }}>
                 {csvTransactions.filter((t) => t.selected).length} sélectionnée(s)
               </span>
             </div>
 
-            <div style={{ maxHeight: 420, overflowY: "auto", border: `1px solid ${C.sandLine}`, borderRadius: 10 }}>
+            <div style={{ maxHeight: 400, overflowY: "auto", border: `1px solid ${C.sandLine}`, borderRadius: 10 }}>
               {csvTransactions.map((t, i) => (
-                <div key={t.key} style={{ display: "grid", gridTemplateColumns: "28px 10px 84px 1fr 104px 92px 132px", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: i < csvTransactions.length - 1 ? `1px solid ${C.sandLine}` : "none", background: t.selected ? "#fff" : C.paper }}>
-                  <input type="checkbox" checked={t.selected}
-                    onChange={(e) => setCsvTransactions(csvTransactions.map((x) => x.key === t.key ? { ...x, selected: e.target.checked } : x))}
-                    style={{ width: 16, height: 16 }} />
-                  <span title={t.certain ? "Classée automatiquement" : "À vérifier"}
-                    style={{ width: 7, height: 7, borderRadius: "50%", background: t.certain ? C.sage : C.amber, display: "inline-block" }} />
-                  <span style={{ fontSize: 11.5, color: C.slateLight }}>{t.dateFR}</span>
-                  <span style={{ fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={t.libelle}>
-                    {cleanLabel(t.libelle)}
+                <div key={t.id} style={{ display: "grid", gridTemplateColumns: "32px 90px 1fr 110px 90px 80px", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: i < csvTransactions.length - 1 ? `1px solid ${C.sandLine}` : "none", background: t.selected ? "#fff" : C.paper }}>
+                  <input type="checkbox" checked={t.selected} onChange={(e) => setCsvTransactions(csvTransactions.map((x, j) => j === i ? { ...x, selected: e.target.checked } : x))} style={{ width: 16, height: 16 }} />
+                  <span style={{ fontSize: 11.5, color: C.slateLight }}>{t.date}</span>
+                  <span style={{ fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={t.libelle}>{t.libelle}</span>
+                  <span style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 13, fontWeight: 700, color: t.sens === "credit" ? C.sage : C.clay, textAlign: "right" }}>
+                    {t.sens === "credit" ? "+" : "-"}{t.montant.toFixed(2)} €
                   </span>
-                  <span style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 13, fontWeight: 700, textAlign: "right", color: t.type === "revenu" ? C.sage : t.type === "epargne" ? C.slate : C.clay }}>
-                    {t.type === "revenu" ? "+" : t.type === "epargne" ? "→" : "−"}{t.montant.toFixed(2)} €
-                  </span>
-                  <select value={t.type}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setCsvTransactions(csvTransactions.map((x) => x.key === t.key
-                        ? { ...x, type: v, corrected: true, certain: true,
-                            category: v === "revenu" ? "autre" : v === "epargne" ? "epargne" : "autres" }
-                        : x));
-                    }}
-                    style={{ fontSize: 11.5, padding: "3px 6px", borderRadius: 6, border: `1px solid ${C.sandLine}`, background: t.type === "revenu" ? C.sageBg : t.type === "epargne" ? C.sand : C.clayBg }}>
+                  <select value={t.type} onChange={(e) => setCsvTransactions(csvTransactions.map((x, j) => j === i ? { ...x, type: e.target.value } : x))}
+                    style={{ fontSize: 11.5, padding: "3px 6px", borderRadius: 6, border: `1px solid ${C.sandLine}`, background: t.type === "revenu" ? C.sageBg : C.clayBg }}>
                     <option value="revenu">Revenu</option>
                     <option value="charge">Charge</option>
-                    <option value="epargne">Épargne</option>
                   </select>
-                  <select value={t.category} disabled={t.type === "epargne"}
-                    onChange={(e) => setCsvTransactions(csvTransactions.map((x) => x.key === t.key ? { ...x, category: e.target.value, corrected: true, certain: true } : x))}
+                  <select value={t.category} onChange={(e) => setCsvTransactions(csvTransactions.map((x, j) => j === i ? { ...x, category: e.target.value } : x))}
                     style={{ fontSize: 11.5, padding: "3px 6px", borderRadius: 6, border: `1px solid ${C.sandLine}` }}>
-                    {t.type === "epargne" ? (
-                      <option value="epargne">Épargne</option>
-                    ) : t.type === "revenu" ? (
+                    {t.type === "revenu" ? (
                       INCOME_CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)
                     ) : (
                       CHARGE_CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)
@@ -1392,13 +1153,13 @@ export default function App() {
             </div>
 
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 16 }}>
-              <button onClick={() => { setCsvTransactions(null); setCsvDuplicates(0); }}
+              <button onClick={() => setCsvTransactions(null)}
                 style={{ padding: "9px 18px", borderRadius: 8, border: `1px solid ${C.sandLine}`, background: "#fff", fontWeight: 600, fontSize: 13.5, cursor: "pointer", color: C.slate }}>
                 Annuler
               </button>
               <button onClick={handleCSVConfirm}
                 style={{ padding: "9px 18px", borderRadius: 8, border: "none", background: C.ink, color: "#fff", fontWeight: 700, fontSize: 13.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
-                <CheckCircle2 size={15} /> Importer {csvTransactions.filter((t) => t.selected).length} opération(s)
+                <CheckCircle2 size={15} /> Ajouter {csvTransactions.filter((t) => t.selected).length} transaction(s) au budget
               </button>
             </div>
           </div>
@@ -1406,26 +1167,7 @@ export default function App() {
 
         {view === "dashboard" && (
           <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, margin: "0 0 20px" }}>
-              <h1 style={{ fontFamily: "Fraunces, serif", fontSize: 24, margin: 0 }}>Tableau de bord</h1>
-
-              {/* Sélecteur de mois : n'apparaît que si un historique est importé */}
-              {mois.length > 0 && (
-                <select value={selectedMonth || ""} onChange={(e) => setSelectedMonth(e.target.value)}
-                  style={{ fontSize: 13.5, fontWeight: 600, padding: "7px 12px", borderRadius: 8, border: `1px solid ${C.sandLine}`, background: "#fff", color: C.ink, cursor: "pointer" }}>
-                  {mois.map((m) => (
-                    <option key={m} value={m}>{monthLabel(m)}</option>
-                  ))}
-                </select>
-              )}
-            </div>
-
-            {importInfo && (
-              <div style={{ background: C.sageBg, border: `1px solid ${C.sage}33`, borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: C.slate, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span>{importInfo}</span>
-                <button onClick={() => setImportInfo("")} style={{ background: "none", border: "none", cursor: "pointer", color: C.slate }}><X size={15} /></button>
-              </div>
-            )}
+            <h1 style={{ fontFamily: "Fraunces, serif", fontSize: 24, margin: "0 0 20px" }}>Tableau de bord</h1>
 
             {/* Hero reste à vivre */}
             <div style={{ background: statusBg, borderRadius: 16, padding: 24, marginBottom: 22 }}>
@@ -1437,17 +1179,9 @@ export default function App() {
                   <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 42, fontWeight: 600, color: C.ink, lineHeight: 1.1 }}>
                     {fmt(reste)}
                   </div>
-                  <div style={{ fontSize: 13, color: C.slate, marginTop: 4 }}>
-                    {useReel ? `reste à vivre — ${monthLabel(selectedMonth)}` : "reste à vivre ce mois-ci"}
-                  </div>
-                  {/* Le chiffre le plus utile au quotidien : combien par jour */}
-                  {parJour && (
-                    <div style={{ fontSize: 13.5, color: statusColor, marginTop: 8, fontWeight: 600 }}>
-                      soit {fmt(parJour.parJour)} / jour sur les {parJour.joursRestants} jours restants
-                    </div>
-                  )}
+                  <div style={{ fontSize: 13, color: C.slate, marginTop: 4 }}>reste à vivre ce mois-ci</div>
                 </div>
-                <div style={{ display: "flex", gap: 22, flexWrap: "wrap" }}>
+                <div style={{ display: "flex", gap: 22 }}>
                   <div>
                     <div style={{ fontSize: 12, color: C.slate }}>Revenus</div>
                     <div style={{ fontFamily: "IBM Plex Mono, monospace", fontWeight: 600 }}>{fmt(totalIncome)}</div>
@@ -1456,18 +1190,6 @@ export default function App() {
                     <div style={{ fontSize: 12, color: C.slate }}>Charges</div>
                     <div style={{ fontFamily: "IBM Plex Mono, monospace", fontWeight: 600 }}>{fmt(totalCharges)}</div>
                   </div>
-                  {totalEpargne > 0 && (
-                    <div>
-                      <div style={{ fontSize: 12, color: C.slate }}>Épargne</div>
-                      <div style={{ fontFamily: "IBM Plex Mono, monospace", fontWeight: 600 }}>{fmt(totalEpargne)}</div>
-                    </div>
-                  )}
-                  {totalProvisions > 0 && (
-                    <div title="Mis de côté pour les dépenses non mensuelles">
-                      <div style={{ fontSize: 12, color: C.slate }}>Provisions</div>
-                      <div style={{ fontFamily: "IBM Plex Mono, monospace", fontWeight: 600 }}>{fmt(totalProvisions)}</div>
-                    </div>
-                  )}
                 </div>
               </div>
               <div style={{ marginTop: 20 }}>
@@ -1674,147 +1396,16 @@ export default function App() {
 
         {view === "echeances" && (
           <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
               <h1 style={{ fontFamily: "Fraunces, serif", fontSize: 24, margin: 0 }}>Échéances & paperasse</h1>
               {editingEcheance === null && (
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <button onClick={() => setShowSetup((v) => !v)}
-                    style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 8, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, color: C.ink, cursor: "pointer" }}>
-                    <ShieldCheck size={14} /> Installer mes échéances
-                  </button>
-                  <PrimaryBtn onClick={() => setEditingEcheance("new")}><Plus size={15} /> Ajouter une échéance</PrimaryBtn>
-                </div>
+                <PrimaryBtn onClick={() => setEditingEcheance("new")}><Plus size={15} /> Ajouter une échéance</PrimaryBtn>
               )}
             </div>
             <p style={{ fontSize: 12.5, color: C.slateLight, margin: "0 0 16px" }}>
               Les échéances sont mises en évidence visuellement (en retard / J-7) à chaque ouverture de l'app. Les notifications push/email
               automatiques ne sont pas incluses dans cette V1 gratuite (elles demandent un petit service serveur) — à ajouter plus tard si besoin.
             </p>
-
-            {/* --- Installation guidée des échéances administratives --- */}
-            {showSetup && (
-              <div style={{ background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 14, padding: 20, marginBottom: 20 }}>
-                <h2 style={{ fontFamily: "Fraunces, serif", fontSize: 18, margin: "0 0 4px" }}>Installer mes échéances</h2>
-                <p style={{ fontSize: 12.5, color: C.slateLight, margin: "0 0 14px" }}>
-                  Coche ce qui te concerne. L'appli calcule les dates et crée les rappels.
-                  Les dates administratives bougent d'une année à l'autre : vérifie-les une fois installées.
-                </p>
-
-                <div style={{ fontSize: 12.5, fontWeight: 700, color: C.slate, marginBottom: 8 }}>Mon code postal</div>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
-                  <input value={codePostal} onChange={(e) => setCodePostal(e.target.value.replace(/\D/g, "").slice(0, 5))}
-                    placeholder="37230" inputMode="numeric"
-                    style={{ width: 110, padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.sandLine}`, fontSize: 13.5, fontFamily: "IBM Plex Mono, monospace" }} />
-                  <span style={{ fontSize: 12.5, color: C.slateLight }}>
-                    {codePostal.length >= 2
-                      ? `Zone fiscale ${zoneFiscale(codePostal)} — la date limite de déclaration en dépend.`
-                      : "Sert à calculer ta date limite de déclaration de revenus."}
-                  </span>
-                </div>
-
-                <div style={{ fontSize: 12.5, fontWeight: 700, color: C.slate, marginBottom: 8 }}>Ma situation</div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 18 }}>
-                  {[
-                    { id: "caf", label: "Je touche la CAF" },
-                    { id: "enfants", label: "J'ai des enfants à charge" },
-                    { id: "locataire", label: "Je suis locataire" },
-                    { id: "locataire_social", label: "Logement social (CDC, HLM…)" },
-                    { id: "vehicule", label: "J'ai un véhicule" },
-                    { id: "france_travail", label: "Je suis inscrit à France Travail" },
-                  ].map((p) => {
-                    const actif = profils.includes(p.id);
-                    return (
-                      <button key={p.id}
-                        onClick={() => setProfils((prev) => actif ? prev.filter((x) => x !== p.id) : [...prev, p.id])}
-                        style={{ fontSize: 12.5, padding: "7px 12px", borderRadius: 20, cursor: "pointer", fontWeight: 600,
-                          border: `1px solid ${actif ? C.ink : C.sandLine}`,
-                          background: actif ? C.ink : "#fff", color: actif ? "#fff" : C.slate }}>
-                        {p.label}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <div style={{ fontSize: 12.5, fontWeight: 700, color: C.slate, marginBottom: 8 }}>
-                  Dépenses à provisionner
-                  <span style={{ fontWeight: 400, color: C.slateLight }}> — les grosses dépenses non mensuelles, lissées sur l'année</span>
-                </div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
-                  {PROVISIONS_TYPES.map((p) => {
-                    const actif = provChoisies.includes(p.id);
-                    return (
-                      <button key={p.id} title={p.note}
-                        onClick={() => setProvChoisies((prev) => actif ? prev.filter((x) => x !== p.id) : [...prev, p.id])}
-                        style={{ fontSize: 12.5, padding: "7px 12px", borderRadius: 20, cursor: "pointer", fontWeight: 600,
-                          border: `1px solid ${actif ? C.sage : C.sandLine}`,
-                          background: actif ? C.sageBg : "#fff", color: actif ? C.ink : C.slate }}>
-                        {p.label}{p.montantIndicatif > 0 ? ` · ${p.montantIndicatif} €` : ""}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {provChoisies.length > 0 && (
-                  <div style={{ background: C.sand, borderRadius: 10, padding: "12px 14px", marginBottom: 14, fontSize: 13 }}>
-                    <strong>{fmt(totalProvisionMensuelle(genererProvisions(provChoisies, uid)))}</strong> à mettre de côté chaque mois
-                    pour absorber ces dépenses sans trou dans le budget.
-                    <div style={{ fontSize: 12, color: C.slateLight, marginTop: 4 }}>
-                      Les montants proposés sont indicatifs : tu pourras les ajuster ensuite.
-                    </div>
-                  </div>
-                )}
-
-                <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-                  <button onClick={() => setShowSetup(false)}
-                    style={{ padding: "9px 18px", borderRadius: 8, border: `1px solid ${C.sandLine}`, background: "#fff", fontWeight: 600, fontSize: 13.5, cursor: "pointer", color: C.slate }}>
-                    Annuler
-                  </button>
-                  <button onClick={installerEcheances}
-                    style={{ padding: "9px 18px", borderRadius: 8, border: "none", background: C.ink, color: "#fff", fontWeight: 700, fontSize: 13.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
-                    <CheckCircle2 size={15} /> Installer
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* --- Provisions en cours --- */}
-            {(state.provisions || []).length > 0 && (
-              <div style={{ background: "#fff", border: `1px solid ${C.sandLine}`, borderRadius: 14, padding: 20, marginBottom: 20 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
-                  <h2 style={{ fontFamily: "Fraunces, serif", fontSize: 18, margin: 0 }}>Postes provisionnés</h2>
-                  <div style={{ fontSize: 13, color: C.slate }}>
-                    total <strong style={{ fontFamily: "IBM Plex Mono, monospace" }}>{fmt(totalProvisionMensuelle(state.provisions))}</strong> / mois
-                  </div>
-                </div>
-                {state.provisions.map((p, i) => {
-                  const c = calculProvision(p.cible, p.dateISO, p.dejaMis);
-                  const pct = p.cible > 0 ? Math.min(100, ((p.dejaMis || 0) / p.cible) * 100) : 0;
-                  return (
-                    <div key={p.id} style={{ padding: "10px 0", borderBottom: i < state.provisions.length - 1 ? `1px solid ${C.sandLine}` : "none" }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                        <div style={{ flex: "1 1 220px" }}>
-                          <div style={{ fontSize: 13.5, fontWeight: 600 }}>{p.label}</div>
-                          <div style={{ fontSize: 12, color: C.slateLight }}>
-                            {fmt(p.cible)} pour {new Date(p.dateISO).toLocaleDateString("fr-FR", { month: "long", year: "numeric" })}
-                            {c && ` · ${c.moisRestants} mois restants`}
-                          </div>
-                        </div>
-                        <div style={{ fontFamily: "IBM Plex Mono, monospace", fontWeight: 700, fontSize: 14, color: C.sage }}>
-                          {c ? fmt(c.parMois) : "—"} <span style={{ fontSize: 11, color: C.slateLight, fontWeight: 400 }}>/mois</span>
-                        </div>
-                        <IconBtn danger title="Supprimer"
-                          onClick={() => update((s) => ({ ...s, provisions: s.provisions.filter((x) => x.id !== p.id) }))}>
-                          <Trash2 size={14} />
-                        </IconBtn>
-                      </div>
-                      <div style={{ height: 5, background: C.sand, borderRadius: 3, marginTop: 8, overflow: "hidden" }}>
-                        <div style={{ width: `${pct}%`, height: "100%", background: C.sage }} />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
 
             {editingEcheance === "new" && (
               <>
